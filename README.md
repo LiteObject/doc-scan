@@ -171,26 +171,6 @@ Enable debug mode with `--debug` to save intermediate processing images:
 - Keep the camera/phone steady when taking the photo
 - Avoid reflections and glare on the document surface
 
-## Code Quality
-
-The project follows Python best practices:
-
-- Type hints for better code documentation
-- Comprehensive error handling
-- Modular function design
-- Clear variable naming conventions
-- Detailed docstrings and comments
-- Lint-compliant code (pylint)
-
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Add tests if applicable
-5. Ensure code follows the existing style
-6. Submit a pull request
-
 ## License
 
 This project is open source. Please check the license file for specific terms.
