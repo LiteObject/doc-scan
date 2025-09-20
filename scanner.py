@@ -14,6 +14,67 @@ import cv2
 import numpy as np
 
 
+# -----------------------------
+# Content quality heuristics
+# -----------------------------
+def _to_gray(img):
+    """Ensure grayscale uint8 image."""
+    if img is None or img.size == 0:
+        return img
+    if len(img.shape) == 3 and img.shape[2] == 3:
+        g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    else:
+        g = img
+    if g.dtype != np.uint8:
+        g_min, g_max = float(g.min()), float(g.max())
+        if g_max > g_min:
+            g = ((g - g_min) * (255.0 / (g_max - g_min))).astype(np.uint8)
+        else:
+            g = np.zeros_like(g, dtype=np.uint8)
+    return g
+
+
+def is_near_blank(img):
+    """Return True if the image looks near-blank (very low variance/edges or extreme black/white)."""
+    g = _to_gray(img)
+    if g is None or g.size == 0:
+        return True
+    std = float(g.std())
+    edges = cv2.Canny(g, 50, 150)
+    edge_ratio = float(np.count_nonzero(edges)) / (g.size + 1e-6)
+    # For binary-like cases, check black pixel ratio
+    black_ratio = float(np.count_nonzero(g < 200)) / (g.size + 1e-6)
+    # Heuristics
+    if std < 5 and edge_ratio < 0.005:
+        return True
+    if black_ratio < 0.005 or black_ratio > 0.98:
+        return True
+    return False
+
+
+def content_score(img):
+    """Score how contentful the image is. Higher is better.
+    Combines edge density and contrast; penalizes extreme black/white.
+    """
+    g = _to_gray(img)
+    if g is None or g.size == 0:
+        return -1.0
+    edges = cv2.Canny(g, 50, 150)
+    edge_ratio = float(np.count_nonzero(edges)) / (g.size + 1e-6)
+    contrast = float(g.std()) / 255.0
+    black_ratio = float(np.count_nonzero(g < 200)) / (g.size + 1e-6)
+    # Penalize extreme black/white dominance
+    penalty = 0.0
+    if black_ratio < 0.01 or black_ratio > 0.9:
+        penalty += 0.3
+    # Penalize excessive edge density (often looks noisy/ugly)
+    # Start penalizing after ~12% of pixels are edges, scale up quickly
+    if edge_ratio > 0.12:
+        penalty += min(0.6, (edge_ratio - 0.12) * 3.0)
+    # Favor some edges and good contrast, but reduce weight on edges
+    return (0.45 * edge_ratio + 0.55 * contrast) - penalty
+
+
 def order_points(pts):
     """Order points in clockwise: top-left, top-right, bottom-right, bottom-left"""
     rect = np.zeros((4, 2), dtype="float32")
@@ -309,6 +370,53 @@ def parse_arguments():
         type=str,
         help="Output directory path (default: creates timestamped folder in current directory)",
     )
+    parser.add_argument(
+        "--min-area",
+        type=int,
+        default=1000,
+        help="Minimum contour area (in resized-pixels) to accept as document (default: 1000)",
+    )
+    parser.add_argument(
+        "--fallback-min-area",
+        type=int,
+        default=500,
+        help="Minimum area to allow fallback quad if no primary match is found (default: 500)",
+    )
+    parser.add_argument(
+        "--min-area-frac",
+        type=float,
+        default=0.04,
+        help="If selected quad covers less than this fraction of the resized image, use full-frame fallback (default: 0.04 = 4%)",
+    )
+    parser.add_argument(
+        "--prefer",
+        type=str,
+        choices=[
+            "auto",
+            "grayscale",
+            "original",
+            "otsu",
+            "adaptive-mean",
+            "adaptive-gaussian",
+            "niblack",
+            "combined",
+        ],
+        default="combined",
+        help=(
+            "Choose which variant to save as RECOMMENDED: "
+            "auto (score-based), grayscale, original, otsu, adaptive-mean, adaptive-gaussian, niblack, combined"
+        ),
+    )
+    parser.add_argument(
+        "--doc-type",
+        type=str,
+        choices=["auto", "table", "text"],
+        default="auto",
+        help=(
+            "Bias auto selection for certain content: 'table' favors clean binary and structured edges; "
+            "'text' favors smoother grayscale/less edge-heavy variants; 'auto' leaves default behavior."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -319,6 +427,11 @@ def main():
     input_file = args.input_file
     debug_mode = args.debug
     output_path = args.output
+    min_area_arg = int(getattr(args, "min_area", 1000))
+    fallback_min_area_arg = int(getattr(args, "fallback_min_area", 500))
+    min_area_frac_arg = float(getattr(args, "min_area_frac", 0.04))
+    prefer_variant = getattr(args, "prefer", "auto")
+    doc_type_profile = getattr(args, "doc_type", "auto")
 
     # Check if input file exists
     if not os.path.exists(input_file):
@@ -358,12 +471,14 @@ def main():
     # Preprocess
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (5, 5), 0)
-    edged = cv2.Canny(gray, 75, 200)  # Save debug images if debug mode is enabled
+    edged = cv2.Canny(gray, 75, 200)  # initial edges
+    # Collect alternative edge images for debug saving later
+    debug_alt_images = []
+    # We'll save all debug images later into a single debug_processing folder
     if debug_mode:
-        cv2.imwrite("debug_01_resized.jpg", image)
-        cv2.imwrite("debug_02_gray.jpg", gray)
-        cv2.imwrite("debug_03_edges.jpg", edged)
-        print("Debug: Saved intermediate processing images")
+        print(
+            "Debug: Captured intermediate processing images (will save after processing)"
+        )
 
     # Find contours
     try:
@@ -391,11 +506,47 @@ def main():
                 f"  Contour {i}: area={area:.0f}, perimeter={peri:.0f}, vertices={len(approx)}"
             )
 
+    # Adaptive detection settings
     screen_contour = None
+    epsilon_candidates = [0.02, 0.03, 0.015, 0.025, 0.01, 0.035, 0.04, 0.045, 0.05]
+    min_area = min_area_arg  # initial minimum area (configurable)
+
+    # Track the largest valid quadrilateral (for fallback)
+    best_fallback = {
+        "contour": None,
+        "area": 0,
+        "source": "initial",
+        "epsilon": None,
+        "params": None,
+    }
+
     for c in contours:
         area = cv2.contourArea(c)
-        # Filter out very small contours - document should be significant portion of image
-        min_area = 1000  # Minimum area in pixels for potential document
+
+        # Try to approximate to quadrilateral even if area is small, to consider as fallback
+        peri = cv2.arcLength(c, True)
+        local_quad = None
+        local_eps = None
+        for epsilon_factor in epsilon_candidates:
+            approx = cv2.approxPolyDP(c, epsilon_factor * peri, True)
+            if len(approx) == 4:
+                local_quad = approx
+                local_eps = epsilon_factor
+                break
+
+        # Update best fallback if this quad is the largest seen so far
+        if local_quad is not None and area > best_fallback["area"]:
+            best_fallback.update(
+                {
+                    "contour": local_quad,
+                    "area": area,
+                    "epsilon": local_eps,
+                    "source": "initial",
+                    "params": None,
+                }
+            )
+
+        # Enforce area requirement for primary detection
         if area < min_area:
             if debug_mode:
                 print(
@@ -403,18 +554,13 @@ def main():
                 )
             continue
 
-        peri = cv2.arcLength(c, True)
-        # Try multiple approximation levels for better detection
-        for epsilon_factor in [0.02, 0.03, 0.015, 0.025, 0.01]:
-            approx = cv2.approxPolyDP(c, epsilon_factor * peri, True)
-            if len(approx) == 4:
-                screen_contour = approx
-                if debug_mode:
-                    print(
-                        f"  Found 4-vertex contour with area {area:.0f} and epsilon factor {epsilon_factor}"
-                    )
-                break
-        if screen_contour is not None:
+        # If it's a quad and meets area, accept immediately
+        if local_quad is not None:
+            screen_contour = local_quad
+            if debug_mode:
+                print(
+                    f"  Found 4-vertex contour with area {area:.0f} and epsilon factor {local_eps}"
+                )
             break
 
     if screen_contour is None:
@@ -433,12 +579,15 @@ def main():
             (80, 240),  # Medium-high thresholds
         ]
 
+        # Track alternative-pass best fallback as well (continue using best_fallback)
+        # buffer for alt edge images to save later into debug folder
+        debug_alt_images = []
         for i, (low, high) in enumerate(alternative_params):
             print(f"  Trying Canny({low}, {high})...")
             alt_edged = cv2.Canny(gray, low, high)
 
             if debug_mode:
-                cv2.imwrite(f"debug_alt_edges_{i+1}.jpg", alt_edged)
+                debug_alt_images.append((i + 1, alt_edged))
 
             try:
                 alt_contours, _ = cv2.findContours(
@@ -449,33 +598,77 @@ def main():
                         alt_contours, key=cv2.contourArea, reverse=True
                     )[:5]
                     for c in alt_contours:
-                        # Check if contour is large enough to be a document
                         contour_area = cv2.contourArea(c)
-                        min_area = 1000  # Minimum area in pixels for potential document
+
+                        # Approximate to quadrilateral across candidates
+                        peri = cv2.arcLength(c, True)
+                        local_quad = None
+                        local_eps = None
+                        for epsilon_factor in epsilon_candidates:
+                            approx = cv2.approxPolyDP(c, epsilon_factor * peri, True)
+                            if len(approx) == 4:
+                                local_quad = approx
+                                local_eps = epsilon_factor
+                                break
+
+                        # Update best fallback if this quad is the largest so far
+                        if (
+                            local_quad is not None
+                            and contour_area > best_fallback["area"]
+                        ):
+                            best_fallback.update(
+                                {
+                                    "contour": local_quad,
+                                    "area": contour_area,
+                                    "epsilon": local_eps,
+                                    "source": "alternative",
+                                    "params": (low, high),
+                                }
+                            )
+
+                        # Enforce area requirement for primary detection (configurable)
                         if contour_area < min_area:
                             print(
                                 f"  Skipping small contour (area: {contour_area:.0f} < minimum: {min_area:.0f})"
                             )
                             continue
 
-                        peri = cv2.arcLength(c, True)
-                        # Try multiple approximation levels
-                        for epsilon_factor in [0.02, 0.03, 0.015, 0.025, 0.01, 0.035]:
-                            approx = cv2.approxPolyDP(c, epsilon_factor * peri, True)
-                            if len(approx) == 4:
-                                screen_contour = approx
-                                print(
-                                    f"  ✓ Found 4-sided contour with parameters ({low}, {high}) and epsilon {epsilon_factor}, area: {contour_area:.0f}"
-                                )
-                                break
-                        if screen_contour is not None:
+                        # Accept immediately if meets area and is a quad
+                        if local_quad is not None:
+                            screen_contour = local_quad
+                            print(
+                                f"  ✓ Found 4-sided contour with parameters ({low}, {high}) and epsilon {local_eps}, area: {contour_area:.0f}"
+                            )
                             break
+                    if screen_contour is not None:
+                        break
             except cv2.error as e:
                 print(f"    Error with parameters ({low}, {high}): {e}")
                 continue
 
             if screen_contour is not None:
                 break
+
+    # Final fallback: if nothing met the min_area but we found a valid quadrilateral,
+    # use the largest one above a smaller safety threshold, with a warning to the user.
+    if screen_contour is None and best_fallback["contour"] is not None:
+        if best_fallback["area"] >= fallback_min_area_arg:
+            print("\n⚠ No contour met the 1000px minimum.")
+            src = best_fallback["source"]
+            eps = best_fallback["epsilon"]
+            params = best_fallback["params"]
+            if params is not None:
+                print(
+                    f"  Using largest quadrilateral found: {best_fallback['area']:.0f} px, from {src} pass, Canny{params}, epsilon {eps}"
+                )
+            else:
+                print(
+                    f"  Using largest quadrilateral found: {best_fallback['area']:.0f} px, from {src} pass, epsilon {eps}"
+                )
+            print(
+                "  Note: This may be a partial document or a small region. Check the output."
+            )
+            screen_contour = best_fallback["contour"]
 
     if screen_contour is None:
         print("Error: Could not find a rectangular document contour!")
@@ -487,13 +680,36 @@ def main():
     # Apply the four point transform to obtain a top-down view of the original image
     contour_points = screen_contour.reshape(4, 2) * ratio
 
+    # Guard against extremely small selected regions: if the selected quadrilateral
+    # covers too little of the resized image, prefer a full-frame fallback to avoid
+    # blank/meaningless results.
+    # Default initialization for debug safety
+    selected_area = 0.0
+    area_fraction = 0.0
+    try:
+        small_region_fallback = False
+        resized_total_area = float(image.shape[0] * image.shape[1])
+        selected_area = float(cv2.contourArea(screen_contour))
+        area_fraction = selected_area / (resized_total_area + 1e-6)
+        # Threshold: if selected region < 4% of resized image, it's likely noise
+        if area_fraction < min_area_frac_arg:
+            print(
+                f"⚠ Selected region is very small: {area_fraction*100:.2f}% of image. Using full-frame fallback."
+            )
+            small_region_fallback = True
+    except Exception:
+        small_region_fallback = False
+
     try:
         # Try to warp the original image
         if orig.shape[0] == 0 or orig.shape[1] == 0:
             print("Error: Original image has invalid dimensions!")
             sys.exit(1)
 
-        warped = four_point_transform(orig, contour_points)
+        if small_region_fallback:
+            warped = orig.copy()
+        else:
+            warped = four_point_transform(orig, contour_points)
 
         if warped is None or warped.shape[0] == 0 or warped.shape[1] == 0:
             print("Error: Perspective transformation failed!")
@@ -532,6 +748,73 @@ def main():
             warped,  # perspective corrected
         )
 
+        # Build named variants for selection
+        variants = {
+            "combined": final_processed,
+            "adaptive-gaussian": adaptive_gaussian_thresh,
+            "adaptive-mean": adaptive_mean_thresh,
+            "otsu": otsu_thresh,
+            "niblack": niblack_thresh,
+            "grayscale": enhanced_img,
+            "original": warped,
+        }
+        # Default to combined as a safe baseline
+        best_img = final_processed
+        chosen_variant_name = "combined"
+
+        # Choose RECOMMENDED based on preference
+        if prefer_variant != "auto":
+            best_img = variants.get(prefer_variant)
+            if (
+                best_img is None
+                or getattr(best_img, "size", 0) == 0
+                or is_near_blank(best_img)
+            ):
+                # fall back to auto if chosen variant is invalid/blank
+                prefer_variant = "auto"
+            else:
+                chosen_variant_name = prefer_variant
+
+        if prefer_variant == "auto":
+            best_img, best_score = None, -1.0
+            chosen_variant_name = "combined"
+            for name, img_candidate in variants.items():
+                if img_candidate is None or getattr(img_candidate, "size", 0) == 0:
+                    continue
+                if is_near_blank(img_candidate):
+                    continue
+                score = content_score(img_candidate)
+                # Apply profile-based biases
+                if doc_type_profile == "table":
+                    # Favor strong black/white and clear lines
+                    if name in ("combined", "otsu", "adaptive-gaussian"):
+                        score += 0.10
+                    if name in ("grayscale", "original"):
+                        score -= 0.05
+                elif doc_type_profile == "text":
+                    # Favor smoother grayscale to avoid jaggy edges
+                    if name in ("grayscale",):
+                        score += 0.12
+                    if name in ("combined", "otsu"):
+                        score -= 0.08
+                if score > best_score:
+                    best_img, best_score = img_candidate, score
+                    chosen_variant_name = name
+            if best_img is None:
+                best_img = final_processed
+                chosen_variant_name = "combined"
+
+        if debug_mode and debug_dir:
+            # Save a simple overlay showing detected contour on the resized image
+            overlay = image.copy()
+            try:
+                cv2.drawContours(
+                    overlay, [screen_contour.astype(int)], -1, (0, 255, 0), 2
+                )
+                cv2.imwrite(f"{debug_dir}/debug_detected_contour.jpg", overlay)
+            except Exception:
+                pass
+
         # Save debug images if debug mode is enabled
         if debug_mode and debug_dir:
             os.makedirs(debug_dir, exist_ok=True)
@@ -539,20 +822,37 @@ def main():
             cv2.imwrite(f"{debug_dir}/debug_02_gray.jpg", gray)
             cv2.imwrite(f"{debug_dir}/debug_03_edges.jpg", edged)
             cv2.imwrite(f"{debug_dir}/debug_04_warped.jpg", warped)
+            # Save alternative edge images captured earlier
+            try:
+                for idx, alt_img in debug_alt_images:
+                    cv2.imwrite(f"{debug_dir}/debug_alt_edges_{idx}.jpg", alt_img)
+            except Exception:
+                pass
+            # Save region stats
+            try:
+                with open(
+                    f"{debug_dir}/debug_region_info.txt", "w", encoding="utf-8"
+                ) as f:
+                    f.write(
+                        f"selected_area_px_resized={selected_area:.1f}\narea_fraction={area_fraction:.6f}\nsmall_region_fallback={small_region_fallback}\n"
+                    )
+            except Exception:
+                pass
             print(f"🔧 Debug processing images saved to: {debug_dir}/")
 
         # Also save main outputs in the root directory for convenience
         try:
             # Save the recommended version and grayscale in main folder
-            cv2.imwrite(
-                f"{output_dir}/RECOMMENDED_scanned_document.jpg", final_processed
-            )
+            if best_img is None or getattr(best_img, "size", 0) == 0:
+                best_img = final_processed
+            cv2.imwrite(f"{output_dir}/RECOMMENDED_scanned_document.jpg", best_img)
             cv2.imwrite(f"{output_dir}/GRAYSCALE_enhanced.jpg", enhanced_img)
 
             print(f"\n🎉 SUCCESS! All outputs saved to: {output_dir}/")
             print("=" * 60)
             print("📁 QUICK ACCESS FILES:")
             print("   • RECOMMENDED_scanned_document.jpg (main result)")
+            print(f"     ↳ Variant used: {chosen_variant_name}")
             print("   • GRAYSCALE_enhanced.jpg (enhanced grayscale)")
             print("📂 QUALITY COMPARISON:")
             print(f"   • {quality_dir}/ (all 7 versions + selection guide)")

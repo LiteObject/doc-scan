@@ -11,6 +11,9 @@ A Python-based document scanner that automatically detects document boundaries, 
 - **Flexible Output**: Supports custom output directories with organized file structure
 - **Debug Mode**: Optional intermediate image saving for troubleshooting
 - **Command Line Interface**: Easy-to-use CLI with comprehensive options
+- **Robust Fallbacks**: Avoids blank outputs by using a full-frame fallback when the detected region is too small
+- **RECOMMENDED Control**: Choose which processed variant is saved as RECOMMENDED via `--prefer`
+ - **Profiles**: Bias auto selection for tables vs text via `--doc-type`
 
 ## Installation
 
@@ -61,6 +64,23 @@ python scanner.py document.jpg --debug
 
 # Combine options
 python scanner.py document.jpg --output ./scans --debug
+
+# Tune detection thresholds
+python scanner.py document.jpg --min-area 1500 --fallback-min-area 600 --min-area-frac 0.05
+
+# Choose the RECOMMENDED variant
+# Force clean binary (default behavior)
+python scanner.py document.jpg --prefer combined
+
+# Use enhanced grayscale as recommended
+python scanner.py document.jpg --prefer grayscale
+
+# Let the tool auto-select based on content scoring
+python scanner.py document.jpg --prefer auto
+
+# Bias auto selection for tables (crisp B/W lines) or text (smoother)
+python scanner.py document.jpg --prefer auto --doc-type table
+python scanner.py document.jpg --prefer auto --doc-type text
 ```
 
 ### Command Line Arguments
@@ -68,6 +88,11 @@ python scanner.py document.jpg --output ./scans --debug
 - `input_file`: Path to the input image file (required)
 - `--output, -o`: Custom output directory path (optional)
 - `--debug`: Enable debug mode to save intermediate processing images (optional)
+- `--min-area`: Minimum contour area (in resized-pixels) to accept as the document (default: 1000)
+- `--fallback-min-area`: Minimum area to allow a fallback quadrilateral if no primary match is found (default: 500)
+- `--min-area-frac`: If the selected quadrilateral covers less than this fraction of the resized image, use full-frame fallback (default: 0.04 = 4%)
+- `--prefer`: Which variant to save as RECOMMENDED. Options: `combined` (default), `grayscale`, `original`, `otsu`, `adaptive-mean`, `adaptive-gaussian`, `niblack`, `auto` (score-based)
+- `--doc-type`: Biases auto selection. Options: `auto` (default), `table` (favor crisp B/W and structured edges), `text` (favor smoother grayscale)
 - `--help, -h`: Show help message and usage examples
 
 ## Output Structure
@@ -91,7 +116,11 @@ output_directory/
 │   └── debug_processing/            # Debug images (if --debug enabled)
 │       ├── debug_01_resized.jpg
 │       ├── debug_02_gray.jpg
-│       └── debug_03_edges.jpg
+│       ├── debug_03_edges.jpg
+│       ├── debug_04_warped.jpg
+│       ├── debug_detected_contour.jpg
+│       ├── debug_alt_edges_*.jpg
+│       └── debug_region_info.txt    # Area stats and fallback info
 ```
 
 ## Quality Processing Options
@@ -131,10 +160,14 @@ The scanner includes comprehensive error handling for:
 
 Enable debug mode with `--debug` to save intermediate processing images:
 
-- Resized input image
-- Grayscale conversion
-- Edge detection results
-- Alternative edge detection attempts (if needed)
+- Resized input image, grayscale, and initial edges
+- Alternative edge images across multiple Canny thresholds
+- Detected contour overlay
+- Warped image (or full-frame fallback) and region stats
+
+### Full-frame fallback (anti-blank safeguard)
+
+When the detected quadrilateral covers less than a configurable fraction of the resized image (`--min-area-frac`, default 4%), the scanner skips perspective warp and processes the full original frame. This prevents blank or near-blank outputs from tiny/noisy contours.
 
 ## Technical Details
 
@@ -160,7 +193,12 @@ Enable debug mode with `--debug` to save intermediate processing images:
 
 1. **"No contours found"**: Ensure the document has clear edges and good contrast
 2. **"No rectangular contour found"**: Try with better lighting or clearer document boundaries
-3. **Poor scan quality**: Check the quality_comparison folder for alternative versions
+3. **Poor scan quality or harsh-looking “recommended”**:
+	- The scanner scores all variants and skips near-blank candidates.
+	- If the recommended looks too bold/harsh, try `--prefer grayscale` or keep `--prefer combined` and adjust brightness/contrast in a viewer.
+	- If results still look weak, raise `--min-area-frac` (e.g., 0.06–0.1) to force full-frame processing more often, or increase `--min-area` (e.g., 1500–3000).
+
+Note: The console prints which variant was saved as RECOMMENDED (for example, `Variant used: combined`).
 4. **File permission errors**: Ensure write permissions for the output directory
 
 ### Tips for Better Results
