@@ -75,18 +75,38 @@ def advanced_threshold(img):
 
 def create_high_quality_scan(img):
     """Create high-quality scan using enhanced image processing"""
+    print(f"Input image shape: {img.shape}")
+    print(f"Input image type: {img.dtype}")
+    print(f"Input image range: {img.min()}-{img.max()}")
+
     # Convert to grayscale if needed
     if len(img.shape) == 3:
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        print("Converted to grayscale")
     else:
         gray = img.copy()
+        print("Already grayscale")
+
+    print(f"Grayscale shape: {gray.shape}")
+    print(f"Grayscale range: {gray.min()}-{gray.max()}")
 
     enhanced_img = enhance_image_quality(gray)
+    print(f"Enhanced image range: {enhanced_img.min()}-{enhanced_img.max()}")
 
     # Get all threshold versions
     otsu_thresh, adaptive_mean_thresh, adaptive_gaussian_thresh, niblack_thresh = (
         advanced_threshold(enhanced_img)
     )
+
+    # Debug thresholding results
+    print(f"Otsu threshold range: {otsu_thresh.min()}-{otsu_thresh.max()}")
+    print(
+        f"Adaptive mean range: {adaptive_mean_thresh.min()}-{adaptive_mean_thresh.max()}"
+    )
+    print(
+        f"Adaptive Gaussian range: {adaptive_gaussian_thresh.min()}-{adaptive_gaussian_thresh.max()}"
+    )
+    print(f"Niblack range: {niblack_thresh.min()}-{niblack_thresh.max()}")
 
     # Create final optimized version by combining techniques
     # Use adaptive Gaussian as base and refine with morphological operations
@@ -95,6 +115,8 @@ def create_high_quality_scan(img):
         adaptive_gaussian_thresh, cv2.MORPH_CLOSE, kernel
     )
     final_processed = cv2.morphologyEx(final_processed, cv2.MORPH_OPEN, kernel)
+
+    print(f"Final processed range: {final_processed.min()}-{final_processed.max()}")
 
     return (
         enhanced_img,
@@ -175,8 +197,29 @@ def save_all_quality_versions(
 
     for img_data, filename, _ in versions:
         filepath = f"{quality_dir}/{filename}"
+
+        # Validate image before saving
+        if img_data is None:
+            print(f"   ⚠ {filename} - Image is None!")
+            continue
+        if img_data.size == 0:
+            print(f"   ⚠ {filename} - Image is empty!")
+            continue
+
+        # Check if image is completely blank (all black or all white)
+        unique_values = len(np.unique(img_data))
+        img_min, img_max = img_data.min(), img_data.max()
+
+        if unique_values == 1:
+            print(f"   ⚠ {filename} - Image has only one value ({img_min})")
+        elif img_min == img_max:
+            print(f"   ⚠ {filename} - Image has uniform value ({img_min})")
+        else:
+            print(
+                f"   ✓ {filename} (range: {img_min}-{img_max}, unique values: {unique_values})"
+            )
+
         cv2.imwrite(filepath, img_data)
-        print(f"   ✓ {filename}")
 
     # Create selection guide
     guide_content = """QUALITY COMPARISON GUIDE
@@ -315,9 +358,7 @@ def main():
     # Preprocess
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (5, 5), 0)
-    edged = cv2.Canny(gray, 75, 200)
-
-    # Save debug images if debug mode is enabled
+    edged = cv2.Canny(gray, 75, 200)  # Save debug images if debug mode is enabled
     if debug_mode:
         cv2.imwrite("debug_01_resized.jpg", image)
         cv2.imwrite("debug_02_gray.jpg", gray)
@@ -352,10 +393,28 @@ def main():
 
     screen_contour = None
     for c in contours:
+        area = cv2.contourArea(c)
+        # Filter out very small contours - document should be significant portion of image
+        min_area = 1000  # Minimum area in pixels for potential document
+        if area < min_area:
+            if debug_mode:
+                print(
+                    f"  Skipping small contour with area {area:.0f} (min required: {min_area:.0f})"
+                )
+            continue
+
         peri = cv2.arcLength(c, True)
-        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-        if len(approx) == 4:
-            screen_contour = approx
+        # Try multiple approximation levels for better detection
+        for epsilon_factor in [0.02, 0.03, 0.015, 0.025, 0.01]:
+            approx = cv2.approxPolyDP(c, epsilon_factor * peri, True)
+            if len(approx) == 4:
+                screen_contour = approx
+                if debug_mode:
+                    print(
+                        f"  Found 4-vertex contour with area {area:.0f} and epsilon factor {epsilon_factor}"
+                    )
+                break
+        if screen_contour is not None:
             break
 
     if screen_contour is None:
@@ -368,6 +427,10 @@ def main():
             (100, 250),  # Higher thresholds
             (30, 100),  # Much lower thresholds
             (150, 300),  # Much higher thresholds
+            (20, 80),  # Very low thresholds for weak edges
+            (40, 120),  # Low-medium thresholds
+            (60, 180),  # Medium thresholds
+            (80, 240),  # Medium-high thresholds
         ]
 
         for i, (low, high) in enumerate(alternative_params):
@@ -386,13 +449,26 @@ def main():
                         alt_contours, key=cv2.contourArea, reverse=True
                     )[:5]
                     for c in alt_contours:
-                        peri = cv2.arcLength(c, True)
-                        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-                        if len(approx) == 4:
-                            screen_contour = approx
+                        # Check if contour is large enough to be a document
+                        contour_area = cv2.contourArea(c)
+                        min_area = 1000  # Minimum area in pixels for potential document
+                        if contour_area < min_area:
                             print(
-                                f"  ✓ Found 4-sided contour with parameters ({low}, {high})"
+                                f"  Skipping small contour (area: {contour_area:.0f} < minimum: {min_area:.0f})"
                             )
+                            continue
+
+                        peri = cv2.arcLength(c, True)
+                        # Try multiple approximation levels
+                        for epsilon_factor in [0.02, 0.03, 0.015, 0.025, 0.01, 0.035]:
+                            approx = cv2.approxPolyDP(c, epsilon_factor * peri, True)
+                            if len(approx) == 4:
+                                screen_contour = approx
+                                print(
+                                    f"  ✓ Found 4-sided contour with parameters ({low}, {high}) and epsilon {epsilon_factor}, area: {contour_area:.0f}"
+                                )
+                                break
+                        if screen_contour is not None:
                             break
             except cv2.error as e:
                 print(f"    Error with parameters ({low}, {high}): {e}")
@@ -424,6 +500,8 @@ def main():
             sys.exit(1)
 
         print("Perspective correction completed!")
+        print(f"Warped image shape: {warped.shape}")
+        print(f"Warped image range: {warped.min()}-{warped.max()}")
 
         # Process the warped image with high quality enhancements
         output_dir = create_output_directory(output_path)
@@ -460,6 +538,7 @@ def main():
             cv2.imwrite(f"{debug_dir}/debug_01_resized.jpg", image)
             cv2.imwrite(f"{debug_dir}/debug_02_gray.jpg", gray)
             cv2.imwrite(f"{debug_dir}/debug_03_edges.jpg", edged)
+            cv2.imwrite(f"{debug_dir}/debug_04_warped.jpg", warped)
             print(f"🔧 Debug processing images saved to: {debug_dir}/")
 
         # Also save main outputs in the root directory for convenience
