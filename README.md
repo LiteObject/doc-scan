@@ -27,8 +27,8 @@ A Python-based document scanner that automatically detects document boundaries, 
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/LiteObject/doc-scan.git
-cd doc-scan
+git clone https://github.com/LiteObject/doc-scanner.git
+cd doc-scanner
 ```
 
 2. Create a virtual environment (recommended):
