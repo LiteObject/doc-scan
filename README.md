@@ -14,6 +14,7 @@ A Python-based document scanner that automatically detects document boundaries, 
 - **Robust Fallbacks**: Avoids blank outputs by using a full-frame fallback when the detected region is too small
 - **RECOMMENDED Control**: Choose which processed variant is saved as RECOMMENDED via `--prefer`
  - **Profiles**: Bias auto selection for tables vs text via `--doc-type`
+ - **Printer-Friendly Conversion**: Remove background colors to save ink while preserving text and images
 
 ## Installation
 
@@ -51,6 +52,36 @@ pip install opencv-python numpy
 
 ```bash
 python scanner.py input_image.jpg
+```
+
+### Make Documents Printer-Friendly
+
+Remove background colors to save printer ink while keeping text and images readable:
+
+```bash
+# Basic usage - auto-detect and remove background
+python make_printable.py document.jpg
+
+# Use aggressive background removal for heavily colored documents
+python make_printable.py document.jpg --method aggressive
+
+# Uneven lighting or shaded pages
+python make_printable.py document.jpg --method adaptive
+
+# Pages with strong colored backgrounds
+python make_printable.py document.jpg --method color
+
+# Set custom threshold for fine control
+python make_printable.py document.jpg --method custom --threshold 210
+
+# Skip enhancement for faster processing
+python make_printable.py document.jpg --no-enhance
+
+# Enable debug mode to see before/after comparison
+python make_printable.py document.jpg --debug
+
+# Specify output directory
+python make_printable.py document.jpg --output ./printable_docs
 ```
 
 ### Advanced Options
@@ -208,6 +239,53 @@ Note: The console prints which variant was saved as RECOMMENDED (for example, `V
 - Place the document on a contrasting background
 - Keep the camera/phone steady when taking the photo
 - Avoid reflections and glare on the document surface
+
+## Scripts
+
+### scanner.py
+The main document scanner that detects boundaries and applies perspective correction.
+
+### make_printable.py
+Prepares documents for printing by:
+- Removing background colors to save ink
+- Preserving text and image quality
+- Creating multiple versions (color w/ white background, text-optimized, grayscale, B&W)
+- Estimating ink savings
+- Providing enhanced versions for better print quality
+
+#### make_printable.py Options
+
+- `input_file`: Path to the input image file (required)
+- `--output, -o`: Output directory (default: ./output)
+- `--method, -m`: Background removal method
+	- `auto`: Automatically determine threshold based on background
+	- `light`: Light background removal (keeps more detail)
+	- `aggressive`: Aggressive removal (maximum ink saving)
+	- `adaptive`: Adaptive thresholding for uneven lighting
+	- `color`: HSV color-based removal for colored backgrounds
+	- `custom`: Use custom threshold value
+- `--threshold, -t`: Custom threshold value (0-255) for method=custom
+- `--no-enhance`: Skip enhancement step for faster processing
+- `--debug`: Save debug images including before/after comparison
+
+#### Printable Output Structure
+
+```
+output_directory/
+├── printable_YYYYMMDD_HHMMSS/
+│   ├── PRINTABLE_document.jpg           # Recommended for printing
+│   ├── versions/
+│   │   ├── 01_document_background_removed.jpg
+│   │   ├── 02_document_enhanced.jpg     # If enhancement enabled
+│   │   ├── 03_document_text_optimized.jpg
+│   │   ├── 04_document_black_white.jpg  # Maximum ink saving (adaptive)
+│   │   └── 05_document_grayscale.jpg
+│   ├── debug/                           # If --debug enabled
+│   │   ├── original.jpg
+│   │   ├── mask.jpg
+│   │   └── before_after_comparison.jpg
+│   └── README.txt                       # Usage guide
+```
 
 ## License
 
